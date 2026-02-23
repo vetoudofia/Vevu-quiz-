@@ -3,7 +3,7 @@ from flask import Blueprint, request, jsonify
 import uuid
 import random
 from datetime import datetime
-from models import db, User, GameSession, Transaction, Question
+from models import db, User, GameSession, Transaction, Question, ActivityLog
 from config import Config
 from question_service import question_service
 from functools import wraps
@@ -117,10 +117,27 @@ def quick_play_start(current_user):
         time_per_question=10,
         created_by=current_user.id,
         question_data=question_map,
+        started_at=datetime.utcnow(),
         created_at=datetime.utcnow(),
-        started_at=datetime.utcnow()
+        player_count=1
     )
     db.session.add(game)
+    
+    # Update user online status
+    current_user.is_online = True
+    current_user.current_game_id = game_id
+    current_user.current_game_type = 'quick'
+    current_user.current_session_start = datetime.utcnow()
+    current_user.last_activity = datetime.utcnow()
+    
+    # Log activity
+    activity = ActivityLog(
+        id=str(uuid.uuid4()),
+        user_id=current_user.id,
+        action='game_start',
+        details={'game_type': 'quick', 'game_id': game_id, 'stake': stake}
+    )
+    db.session.add(activity)
     
     # Deduct stake
     current_user.balance -= stake
@@ -225,12 +242,27 @@ def quick_play_submit(current_user):
             status='completed'
         )
         db.session.add(win_transaction)
+        
+        # Log win activity
+        activity = ActivityLog(
+            id=str(uuid.uuid4()),
+            user_id=current_user.id,
+            action='win',
+            details={'game_type': 'quick', 'game_id': game_id, 'amount': prize}
+        )
+        db.session.add(activity)
     
     # Update game
     game.status = 'completed'
     game.completed_at = datetime.utcnow()
     if won:
         game.winner_id = current_user.id
+    
+    # Clear user's current game
+    current_user.current_game_id = None
+    current_user.current_game_type = None
+    current_user.current_session_start = None
+    current_user.last_activity = datetime.utcnow()
     
     # Update user games played
     current_user.games_played += 1
@@ -370,10 +402,27 @@ def level_quiz_start(current_user):
         time_per_question=10,
         created_by=current_user.id,
         question_data=question_map,
+        started_at=datetime.utcnow(),
         created_at=datetime.utcnow(),
-        started_at=datetime.utcnow()
+        player_count=1
     )
     db.session.add(game)
+    
+    # Update user online status
+    current_user.is_online = True
+    current_user.current_game_id = game_id
+    current_user.current_game_type = 'level'
+    current_user.current_session_start = datetime.utcnow()
+    current_user.last_activity = datetime.utcnow()
+    
+    # Log activity
+    activity = ActivityLog(
+        id=str(uuid.uuid4()),
+        user_id=current_user.id,
+        action='game_start',
+        details={'game_type': 'level', 'level': level, 'game_id': game_id, 'stake': stake}
+    )
+    db.session.add(activity)
     
     # Deduct stake
     current_user.balance -= stake
@@ -401,4 +450,281 @@ def level_quiz_start(current_user):
         'time_limit': config['questions'] * 10,
         'stake': stake,
         'multiplier': config['multiplier']
+    }), 200
+
+
+# ==================== BATTLE QUIZ ====================
+
+@quiz_bp.route('/battle/available', methods=['GET'])
+@token_required
+def get_available_battles(current_user):
+    """Get available battle games"""
+    
+    games = GameSession.query.filter_by(
+        game_type='battle',
+        status='waiting'
+    ).limit(20).all()
+    
+    return jsonify({
+        'games': [g.to_dict() for g in games]
+    }), 200
+
+
+@quiz_bp.route('/battle/create', methods=['POST'])
+@token_required
+def create_battle(current_user):
+    """Create a battle game"""
+    
+    data = request.json
+    stake = data.get('stake')
+    max_players = data.get('max_players', 3)
+    
+    if not stake:
+        return jsonify({'error': 'Stake amount required'}), 400
+    
+    if current_user.balance < stake:
+        return jsonify({'error': 'Insufficient balance'}), 400
+    
+    # Create battle game
+    game_id = str(uuid.uuid4())
+    game_code = generate_game_code()
+    
+    game = GameSession(
+        id=game_id,
+        game_code=game_code,
+        game_type='battle',
+        status='waiting',
+        stake=stake,
+        platform_fee=calculate_platform_fee(stake * max_players),
+        total_pot=stake * max_players,
+        max_players=max_players,
+        current_players=1,
+        total_questions=50,
+        time_per_question=10,
+        created_by=current_user.id,
+        player_count=1,
+        created_at=datetime.utcnow()
+    )
+    
+    db.session.add(game)
+    
+    # Update user online status
+    current_user.is_online = True
+    current_user.current_game_id = game_id
+    current_user.current_game_type = 'battle'
+    current_user.current_session_start = datetime.utcnow()
+    current_user.last_activity = datetime.utcnow()
+    
+    # Log activity
+    activity = ActivityLog(
+        id=str(uuid.uuid4()),
+        user_id=current_user.id,
+        action='game_created',
+        details={'game_type': 'battle', 'game_id': game_id, 'stake': stake, 'max_players': max_players}
+    )
+    db.session.add(activity)
+    
+    # Deduct stake
+    current_user.balance -= stake
+    
+    # Record transaction
+    transaction = Transaction(
+        id=str(uuid.uuid4()),
+        user_id=current_user.id,
+        game_id=game_id,
+        reference=f"BATTLE-{game_code}",
+        type='stake',
+        amount=stake,
+        status='completed'
+    )
+    db.session.add(transaction)
+    db.session.commit()
+    
+    return jsonify({
+        'success': True,
+        'game_id': game_id,
+        'game_code': game_code,
+        'stake': stake,
+        'max_players': max_players
+    }), 201
+
+
+@quiz_bp.route('/battle/join', methods=['POST'])
+@token_required
+def join_battle(current_user):
+    """Join a battle game"""
+    
+    data = request.json
+    game_id = data.get('game_id')
+    
+    if not game_id:
+        return jsonify({'error': 'Game ID required'}), 400
+    
+    game = GameSession.query.get(game_id)
+    if not game:
+        return jsonify({'error': 'Game not found'}), 404
+    
+    if game.status != 'waiting':
+        return jsonify({'error': 'Game already started'}), 400
+    
+    if game.current_players >= game.max_players:
+        return jsonify({'error': 'Game is full'}), 400
+    
+    if current_user.balance < game.stake:
+        return jsonify({'error': 'Insufficient balance'}), 400
+    
+    # Join game
+    game.current_players += 1
+    game.player_count += 1
+    
+    # Update user online status
+    current_user.is_online = True
+    current_user.current_game_id = game_id
+    current_user.current_game_type = 'battle'
+    current_user.current_session_start = datetime.utcnow()
+    current_user.last_activity = datetime.utcnow()
+    
+    # Log activity
+    activity = ActivityLog(
+        id=str(uuid.uuid4()),
+        user_id=current_user.id,
+        action='game_joined',
+        details={'game_type': 'battle', 'game_id': game_id, 'stake': game.stake}
+    )
+    db.session.add(activity)
+    
+    # Deduct stake
+    current_user.balance -= game.stake
+    
+    # Record transaction
+    transaction = Transaction(
+        id=str(uuid.uuid4()),
+        user_id=current_user.id,
+        game_id=game_id,
+        reference=f"JOIN-{game.game_code}-{current_user.id[:8]}",
+        type='stake',
+        amount=game.stake,
+        status='completed'
+    )
+    db.session.add(transaction)
+    db.session.commit()
+    
+    # Check if game is ready to start
+    if game.current_players >= game.max_players:
+        game.status = 'ready'
+        db.session.commit()
+    
+    return jsonify({
+        'success': True,
+        'game_id': game.id,
+        'game_code': game.game_code,
+        'current_players': game.current_players,
+        'max_players': game.max_players
+    }), 200
+
+
+@quiz_bp.route('/battle/quit', methods=['POST'])
+@token_required
+def quit_battle(current_user):
+    """Quit a battle game (stake lost)"""
+    
+    data = request.json
+    game_id = data.get('game_id')
+    
+    if not game_id:
+        return jsonify({'error': 'Game ID required'}), 400
+    
+    game = GameSession.query.get(game_id)
+    if not game:
+        return jsonify({'error': 'Game not found'}), 404
+    
+    # Update game
+    game.current_players -= 1
+    
+    # Clear user's current game
+    current_user.current_game_id = None
+    current_user.current_game_type = None
+    current_user.current_session_start = None
+    current_user.last_activity = datetime.utcnow()
+    
+    # Log activity
+    activity = ActivityLog(
+        id=str(uuid.uuid4()),
+        user_id=current_user.id,
+        action='game_quit',
+        details={'game_type': 'battle', 'game_id': game_id}
+    )
+    db.session.add(activity)
+    db.session.commit()
+    
+    return jsonify({
+        'success': True,
+        'message': 'You have quit the game. Your stake has been lost.'
+    }), 200
+
+
+# ==================== 1V1 QUIZ ====================
+
+@quiz_bp.route('/1v1/online', methods=['GET'])
+@token_required
+def get_online_players(current_user):
+    """Get online players for 1v1"""
+    
+    # Get users who are online and not in a game
+    online_players = User.query.filter(
+        User.is_online == True,
+        User.id != current_user.id,
+        User.current_game_id == None
+    ).limit(20).all()
+    
+    players_data = [{
+        'id': p.id,
+        'username': f"{p.first_name} {p.last_name}".strip() or p.email,
+        'wins': p.wins,
+        'rank': 0  # Calculate rank based on wins
+    } for p in online_players]
+    
+    return jsonify({'users': players_data}), 200
+
+
+@quiz_bp.route('/1v1/invite', methods=['POST'])
+@token_required
+def send_1v1_invite(current_user):
+    """Send 1v1 game invite"""
+    
+    data = request.json
+    opponent_id = data.get('opponent_id')
+    stake = data.get('stake')
+    
+    if not opponent_id or not stake:
+        return jsonify({'error': 'Opponent and stake required'}), 400
+    
+    # Validate stake
+    if stake < Config.MIN_STAKE:
+        return jsonify({'error': f'Minimum stake is ₦{Config.MIN_STAKE}'}), 400
+    
+    if stake > Config.MAX_STAKE:
+        return jsonify({'error': f'Maximum stake is ₦{Config.MAX_STAKE}'}), 400
+    
+    # Check balance
+    if current_user.balance < stake:
+        return jsonify({'error': 'Insufficient balance'}), 400
+    
+    # Create invite (in production, store in database)
+    invite_id = str(uuid.uuid4())
+    
+    # Log activity
+    activity = ActivityLog(
+        id=str(uuid.uuid4()),
+        user_id=current_user.id,
+        action='invite_sent',
+        details={'opponent_id': opponent_id, 'stake': stake}
+    )
+    db.session.add(activity)
+    db.session.commit()
+    
+    return jsonify({
+        'success': True,
+        'invite_id': invite_id,
+        'message': 'Invite sent successfully'
     }), 200

@@ -8,7 +8,7 @@ import re
 import jwt
 import pyotp
 from datetime import datetime, timedelta
-from models import db, User
+from models import db, User, ActivityLog
 from config import Config
 
 auth_bp = Blueprint('auth', __name__)
@@ -67,6 +67,32 @@ def get_client_ip():
 
 def get_device_id():
     return request.headers.get('X-Device-ID', 'unknown')
+
+# Token decorator for protected routes
+def token_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        token = None
+        auth_header = request.headers.get('Authorization')
+        
+        if auth_header:
+            token = auth_header.split(' ')[1]
+        
+        if not token:
+            return jsonify({'error': 'Token is missing'}), 401
+        
+        try:
+            payload = jwt.decode(token, Config.JWT_SECRET_KEY, algorithms=['HS256'])
+            current_user = User.query.get(payload['user_id'])
+            if not current_user:
+                return jsonify({'error': 'User not found'}), 401
+        except jwt.ExpiredSignatureError:
+            return jsonify({'error': 'Token expired'}), 401
+        except jwt.InvalidTokenError:
+            return jsonify({'error': 'Invalid token'}), 401
+            
+        return f(current_user, *args, **kwargs)
+    return decorated
 
 
 @auth_bp.route('/register', methods=['POST'])
@@ -130,6 +156,8 @@ def register():
         verification_token=verification_token,
         last_login_ip=ip,
         last_device_id=device_id,
+        is_online=False,
+        last_activity=datetime.utcnow(),
         created_at=datetime.utcnow()
     )
     
@@ -141,9 +169,6 @@ def register():
     
     db.session.add(new_user)
     db.session.commit()
-    
-    # In production, send verification email/SMS here
-    # send_verification_email(new_user.email, verification_token)
     
     # Generate tokens
     token = generate_token(new_user.id)
@@ -215,7 +240,18 @@ def login():
     user.last_login = datetime.utcnow()
     user.last_login_ip = ip
     user.last_device_id = device_id
+    user.is_online = True
+    user.last_activity = datetime.utcnow()
     
+    # Log activity
+    activity = ActivityLog(
+        id=str(uuid.uuid4()),
+        user_id=user.id,
+        action='login',
+        ip_address=ip,
+        details={'device_id': device_id}
+    )
+    db.session.add(activity)
     db.session.commit()
     
     # Generate tokens
@@ -228,6 +264,32 @@ def login():
         'refresh_token': refresh_token,
         'user': user.to_dict()
     }), 200
+
+
+@auth_bp.route('/logout', methods=['POST'])
+@token_required
+def logout(current_user):
+    """Logout user"""
+    
+    ip = get_client_ip()
+    
+    current_user.is_online = False
+    current_user.current_game_id = None
+    current_user.current_game_type = None
+    current_user.last_activity = datetime.utcnow()
+    
+    # Log activity
+    activity = ActivityLog(
+        id=str(uuid.uuid4()),
+        user_id=current_user.id,
+        action='logout',
+        ip_address=ip,
+        details={'device_id': current_user.last_device_id}
+    )
+    db.session.add(activity)
+    db.session.commit()
+    
+    return jsonify({'success': True, 'message': 'Logged out successfully'}), 200
 
 
 @auth_bp.route('/refresh', methods=['POST'])
@@ -304,10 +366,6 @@ def forgot_password():
     user.verification_token = otp
     db.session.commit()
     
-    # In production, send OTP via email/SMS
-    # send_otp_email(user.email, otp)
-    # send_otp_sms(user.phone, otp)
-    
     return jsonify({
         'success': True,
         'message': 'OTP sent successfully',
@@ -348,67 +406,33 @@ def reset_password():
 
 
 @auth_bp.route('/profile', methods=['GET'])
-def get_profile():
+@token_required
+def get_profile(current_user):
     """Get user profile"""
     
-    auth_header = request.headers.get('Authorization')
-    
-    if not auth_header:
-        return jsonify({'error': 'No token provided'}), 401
-    
-    try:
-        token = auth_header.split(' ')[1]
-        payload = jwt.decode(token, Config.JWT_SECRET_KEY, algorithms=['HS256'])
-        user = User.query.get(payload['user_id'])
-        
-        if not user:
-            return jsonify({'error': 'User not found'}), 404
-        
-        return jsonify({'user': user.to_dict()}), 200
-        
-    except jwt.ExpiredSignatureError:
-        return jsonify({'error': 'Token expired'}), 401
-    except jwt.InvalidTokenError:
-        return jsonify({'error': 'Invalid token'}), 401
+    return jsonify({'user': current_user.to_dict()}), 200
 
 
 @auth_bp.route('/profile', methods=['PUT'])
-def update_profile():
+@token_required
+def update_profile(current_user):
     """Update user profile"""
     
-    auth_header = request.headers.get('Authorization')
+    data = request.json
     
-    if not auth_header:
-        return jsonify({'error': 'No token provided'}), 401
+    if 'first_name' in data:
+        current_user.first_name = data['first_name']
+    if 'last_name' in data:
+        current_user.last_name = data['last_name']
+    if 'avatar' in data:
+        current_user.avatar = data['avatar']
     
-    try:
-        token = auth_header.split(' ')[1]
-        payload = jwt.decode(token, Config.JWT_SECRET_KEY, algorithms=['HS256'])
-        user = User.query.get(payload['user_id'])
-        
-        if not user:
-            return jsonify({'error': 'User not found'}), 404
-        
-        data = request.json
-        
-        if 'first_name' in data:
-            user.first_name = data['first_name']
-        if 'last_name' in data:
-            user.last_name = data['last_name']
-        if 'avatar' in data:
-            user.avatar = data['avatar']
-        
-        db.session.commit()
-        
-        return jsonify({
-            'success': True,
-            'user': user.to_dict()
-        }), 200
-        
-    except jwt.ExpiredSignatureError:
-        return jsonify({'error': 'Token expired'}), 401
-    except jwt.InvalidTokenError:
-        return jsonify({'error': 'Invalid token'}), 401
+    db.session.commit()
+    
+    return jsonify({
+        'success': True,
+        'user': current_user.to_dict()
+    }), 200
 
 
 @auth_bp.route('/admin/login', methods=['POST'])
@@ -424,7 +448,7 @@ def admin_login():
     if not email or not password:
         return jsonify({'error': 'Email and password required'}), 400
     
-    # Verify admin secret key (from .env)
+    # Verify admin secret key
     if admin_key != os.environ.get('ADMIN_SECRET_KEY'):
         return jsonify({'error': 'Invalid admin credentials'}), 401
     
