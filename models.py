@@ -25,7 +25,7 @@ class User(db.Model):
     
     # Badge & Spins
     badge = db.Column(db.String(20), default='bronze')
-    free_spins = db.Column(db.Integer, default=10)
+    free_spins = db.Column(db.Integer, default=1)  # Changed from 10 to 1
     last_spin_reset = db.Column(db.Date)
     
     # Referral
@@ -44,6 +44,13 @@ class User(db.Model):
     is_active = db.Column(db.Boolean, default=True)
     kyc_status = db.Column(db.String(20), default='pending')
     role = db.Column(db.String(20), default='user')
+    
+    # Online/Activity Tracking - NEW FIELDS
+    is_online = db.Column(db.Boolean, default=False)
+    last_activity = db.Column(db.DateTime)
+    current_game_id = db.Column(db.String(36), db.ForeignKey('game_sessions.id'), nullable=True)
+    current_game_type = db.Column(db.String(20))
+    current_session_start = db.Column(db.DateTime)
     
     # Freeze/Appeal System
     is_frozen = db.Column(db.Boolean, default=False)
@@ -86,79 +93,11 @@ class User(db.Model):
             'kyc_status': self.kyc_status,
             'role': self.role,
             'is_frozen': self.is_frozen,
+            'is_online': self.is_online,  # NEW
+            'last_activity': self.last_activity.isoformat() if self.last_activity else None,  # NEW
+            'current_game_type': self.current_game_type,  # NEW
             'created_at': self.created_at.isoformat() if self.created_at else None
         }
-
-
-class Question(db.Model):
-    __tablename__ = 'questions'
-    
-    __table_args__ = (
-        db.Index('idx_question_level', 'level'),
-        db.Index('idx_question_category', 'category'),
-        db.Index('idx_question_difficulty', 'difficulty'),
-        db.Index('idx_question_active', 'is_active'),
-        db.Index('idx_question_usage', 'times_used'),
-    )
-    
-    id = db.Column(db.String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
-    
-    # Categorization
-    category = db.Column(db.String(50), nullable=False)
-    subcategory = db.Column(db.String(50))
-    level = db.Column(db.String(20), nullable=False)
-    difficulty = db.Column(db.Integer, default=1)
-    
-    # Question content
-    question_text = db.Column(db.Text, nullable=False)
-    option_a = db.Column(db.String(500), nullable=False)
-    option_b = db.Column(db.String(500), nullable=False)
-    option_c = db.Column(db.String(500), nullable=False)
-    option_d = db.Column(db.String(500), nullable=False)
-    correct_answer = db.Column(db.Integer, nullable=False)
-    
-    # Additional fields
-    explanation = db.Column(db.Text)
-    image_url = db.Column(db.String(500))
-    points = db.Column(db.Integer, default=10)
-    time_limit = db.Column(db.Integer, default=10)
-    
-    # Statistics
-    times_used = db.Column(db.Integer, default=0)
-    correct_count = db.Column(db.Integer, default=0)
-    wrong_count = db.Column(db.Integer, default=0)
-    success_rate = db.Column(db.Float, default=0.0)
-    
-    # Status
-    is_active = db.Column(db.Boolean, default=True)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
-    updated_at = db.Column(db.DateTime, onupdate=datetime.utcnow)
-    
-    def update_stats(self, was_correct):
-        self.times_used += 1
-        if was_correct:
-            self.correct_count += 1
-        else:
-            self.wrong_count += 1
-        self.success_rate = (self.correct_count / self.times_used) * 100 if self.times_used > 0 else 0
-    
-    def to_dict(self, include_answer=False):
-        data = {
-            'id': self.id,
-            'category': self.category,
-            'subcategory': self.subcategory,
-            'level': self.level,
-            'difficulty': self.difficulty,
-            'question': self.question_text,
-            'options': [self.option_a, self.option_b, self.option_c, self.option_d],
-            'time_limit': self.time_limit,
-            'points': self.points,
-            'image_url': self.image_url
-        }
-        if include_answer:
-            data['correct'] = self.correct_answer
-            data['explanation'] = self.explanation
-        return data
 
 
 class GameSession(db.Model):
@@ -166,9 +105,9 @@ class GameSession(db.Model):
     
     id = db.Column(db.String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     game_code = db.Column(db.String(20), unique=True, nullable=False)
-    game_type = db.Column(db.String(20), nullable=False)
+    game_type = db.Column(db.String(20), nullable=False)  # quick, level, battle, 1v1, golden
     level = db.Column(db.String(20))
-    status = db.Column(db.String(20), default='waiting')
+    status = db.Column(db.String(20), default='waiting')  # waiting, active, completed, quit
     
     stake = db.Column(db.Float, default=0.0)
     platform_fee = db.Column(db.Float, default=0.0)
@@ -186,9 +125,14 @@ class GameSession(db.Model):
     created_by = db.Column(db.String(36), db.ForeignKey('users.id'))
     winner_id = db.Column(db.String(36), db.ForeignKey('users.id'))
     
-    started_at = db.Column(db.DateTime)
+    # Game timing - UPDATED
+    started_at = db.Column(db.DateTime)  # When game actually starts
     completed_at = db.Column(db.DateTime)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    
+    # Player tracking
+    player_count = db.Column(db.Integer, default=1)  # Track current players
+    players_data = db.Column(db.JSON)  # Store player info and scores
     
     def to_dict(self):
         return {
@@ -201,6 +145,8 @@ class GameSession(db.Model):
             'total_pot': self.total_pot,
             'max_players': self.max_players,
             'current_players': self.current_players,
+            'player_count': self.player_count,
+            'started_at': self.started_at.isoformat() if self.started_at else None,
             'created_at': self.created_at.isoformat() if self.created_at else None
         }
 
@@ -220,7 +166,6 @@ class Transaction(db.Model):
     payment_method = db.Column(db.String(50))
     game_id = db.Column(db.String(36), db.ForeignKey('game_sessions.id'))
     
-    # FIXED: Changed from 'metadata' to 'transaction_metadata' (reserved word issue)
     transaction_metadata = db.Column(db.JSON)
     
     ip_address = db.Column(db.String(45))
@@ -280,17 +225,18 @@ class Appeal(db.Model):
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     reviewed_at = db.Column(db.DateTime)
     
-    # Relationships
     user = db.relationship('User', foreign_keys=[user_id], backref='appeals')
     reviewer = db.relationship('User', foreign_keys=[reviewed_by])
 
 
-class QuestionCategory(db.Model):
-    __tablename__ = 'question_categories'
+class ActivityLog(db.Model):
+    __tablename__ = 'activity_log'
     
     id = db.Column(db.String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
-    name = db.Column(db.String(50), unique=True, nullable=False)
-    description = db.Column(db.String(200))
-    question_count = db.Column(db.Integer, default=0)
-    icon = db.Column(db.String(50))
+    user_id = db.Column(db.String(36), db.ForeignKey('users.id'), nullable=True)
+    action = db.Column(db.String(50), nullable=False)  # login, logout, game_start, game_end, win, stake
+    details = db.Column(db.JSON)
+    ip_address = db.Column(db.String(45))
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    
+    user = db.relationship('User', foreign_keys=[user_id])
