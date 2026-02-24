@@ -4,7 +4,7 @@ import uuid
 import random
 import string
 import requests
-from datetime import datetime
+from datetime import datetime, timedelta
 from models import db, User, Transaction
 from config import Config
 from functools import wraps
@@ -44,6 +44,56 @@ def generate_reference(prefix='TXN'):
     timestamp = datetime.now().strftime('%Y%m%d%H%M%S')
     random_str = ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
     return f"{prefix}-{timestamp}-{random_str}"
+
+
+def get_paystack_balance():
+    """Get Paystack balance"""
+    try:
+        headers = {
+            'Authorization': f'Bearer {Config.PAYSTACK_SECRET_KEY}'
+        }
+        response = requests.get('https://api.paystack.co/balance', headers=headers)
+        if response.status_code == 200:
+            data = response.json()
+            if data['status'] and data['data']:
+                # Paystack returns balance in kobo, convert to naira
+                return data['data'][0]['balance'] / 100
+        # Fallback to 1,000,000 if API fails
+        return 1000000
+    except Exception as e:
+        print(f"Error getting Paystack balance: {e}")
+        return 1000000
+
+
+def notify_admin_low_balance(user, amount, available_balance):
+    """Send notification to admin about low balance"""
+    # Log the alert
+    print(f"⚠️ LOW BALANCE ALERT: User {user.email} requested ₦{amount}, available ₦{available_balance}")
+    
+    # In production, you would:
+    # 1. Send email to admin
+    # 2. Create in-app notification
+    # 3. Send SMS
+    
+    # Create notification in database (you need to create Notification model)
+    try:
+        # Example: Save to a notifications table
+        notification = {
+            'id': str(uuid.uuid4()),
+            'type': 'low_balance_alert',
+            'user_id': user.id,
+            'user_email': user.email,
+            'user_name': f"{user.first_name} {user.last_name}".strip(),
+            'amount_requested': amount,
+            'available_balance': available_balance,
+            'created_at': datetime.utcnow().isoformat(),
+            'read': False
+        }
+        # Save to database - implement based on your schema
+        # db.session.add(notification)
+        # db.session.commit()
+    except Exception as e:
+        print(f"Error saving notification: {e}")
 
 
 # ==================== BALANCE & TRANSACTIONS ====================
@@ -229,7 +279,7 @@ def verify_deposit(current_user):
 @wallet_bp.route('/withdraw/initialize', methods=['POST'])
 @token_required
 def initialize_withdrawal(current_user):
-    """Initialize a withdrawal"""
+    """Initialize a withdrawal with balance check"""
     
     data = request.json
     amount = data.get('amount')
@@ -247,11 +297,29 @@ def initialize_withdrawal(current_user):
     if amount > Config.MAX_WITHDRAWAL:
         return jsonify({'error': f'Maximum withdrawal is ₦{Config.MAX_WITHDRAWAL}'}), 400
     
+    # Check user balance
     if current_user.balance < amount:
         return jsonify({'error': 'Insufficient balance'}), 400
     
+    # Check Paystack balance
+    paystack_balance = get_paystack_balance()
+    
     # Generate reference
     reference = generate_reference('WDR')
+    
+    # Determine processing time based on Paystack balance
+    if amount > paystack_balance:
+        processing_days = 3
+        message = "Your withdrawal request will be processed in 3 working days due to high demand. We'll notify you when completed."
+        
+        # Notify admin
+        notify_admin_low_balance(current_user, amount, paystack_balance)
+    else:
+        processing_days = 1
+        message = "Your withdrawal will be processed within 24 hours"
+    
+    # Calculate estimated completion
+    estimated_completion = datetime.utcnow() + timedelta(days=processing_days)
     
     # Create transaction
     transaction = Transaction(
@@ -262,11 +330,13 @@ def initialize_withdrawal(current_user):
         amount=amount,
         status='pending',
         payment_method='bank_transfer',
-        # FIXED: Changed from 'metadata' to 'transaction_metadata'
         transaction_metadata={
             'bank_code': bank_code,
             'account_number': account_number,
-            'account_name': account_name
+            'account_name': account_name,
+            'processing_days': processing_days,
+            'estimated_completion': estimated_completion.isoformat(),
+            'paystack_balance_at_request': paystack_balance
         },
         created_at=datetime.utcnow()
     )
@@ -279,14 +349,14 @@ def initialize_withdrawal(current_user):
     
     db.session.commit()
     
-    # Notify admin (implement email notification here)
-    
     return jsonify({
         'success': True,
-        'message': 'Withdrawal request submitted',
+        'message': message,
         'reference': reference,
         'amount': amount,
-        'status': 'pending'
+        'status': 'pending',
+        'processing_days': processing_days,
+        'estimated_completion': estimated_completion.isoformat()
     }), 200
 
 
@@ -303,11 +373,21 @@ def withdrawal_status(current_user, reference):
     if not transaction:
         return jsonify({'error': 'Transaction not found'}), 404
     
+    # Get processing info
+    processing_days = 1
+    estimated_completion = None
+    
+    if transaction.transaction_metadata:
+        processing_days = transaction.transaction_metadata.get('processing_days', 1)
+        estimated_completion = transaction.transaction_metadata.get('estimated_completion')
+    
     return jsonify({
         'success': True,
         'reference': reference,
         'status': transaction.status,
         'amount': transaction.amount,
+        'processing_days': processing_days,
+        'estimated_completion': estimated_completion,
         'created_at': transaction.created_at.isoformat() if transaction.created_at else None,
         'processed_at': transaction.processed_at.isoformat() if transaction.processed_at else None
     }), 200
